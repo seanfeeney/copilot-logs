@@ -1,0 +1,93 @@
+jq recipes for Copilot OTel output
+==================================
+
+Two file shapes, two different queries. Attribute values holding messages are JSON
+*strings*, so they need `fromjson` before you can index into them.
+
+  otel/live/otel-live.jsonl   collector output, OTLP envelopes
+                              attributes are an array of {key, value:{stringValue}}
+
+  otel/copilot-otel.jsonl     CLI file exporter, flat one-record-per-line
+                              attributes are a plain {key: value} map
+
+
+1. Expand messages -- collector output
+--------------------------------------
+jq -r '
+  .resourceSpans[]?.scopeSpans[]?.spans[]?
+  | select(.name | startswith("chat"))
+  | .attributes[]
+  | select(.key == "gen_ai.input.messages" or .key == "gen_ai.output.messages")
+  | (.key | sub("gen_ai\\.";"")) as $dir
+  | (.value.stringValue | fromjson)[]
+  | "[\($dir)/\(.role)] " + ([.parts[]? | .content // .text // (.|tostring)] | join("\n"))
+' otel/live/otel-live.jsonl
+
+
+2. Expand messages -- CLI file exporter
+---------------------------------------
+jq -r '
+  select(.type == "span" and (.name | startswith("chat")))
+  | .attributes
+  | to_entries[]
+  | select(.key == "gen_ai.input.messages" or .key == "gen_ai.output.messages")
+  | (.key | sub("gen_ai\\.";"")) as $dir
+  | (.value | fromjson)[]
+  | "[\($dir)/\(.role)] " + ([.parts[]? | .content // .text // (.|tostring)] | join("\n"))
+' otel/copilot-otel.jsonl
+
+The `.content // .text // (.|tostring)` fallback matters: text parts use .content,
+tool-call parts have neither, and tostring keeps them readable instead of printing null.
+
+Most of input.messages on any span is the system prompt plus full conversation
+replay. Pipe to less.
+
+
+3. Assistant replies only
+-------------------------
+Same as above, but narrow the select:
+  | select(.key == "gen_ai.output.messages")
+
+
+4. Tool calls -- arguments and results
+--------------------------------------
+jq -r '.. | objects | select(has("gen_ai.tool.call.arguments"))
+       | "\(."gen_ai.tool.name"): \(."gen_ai.tool.call.arguments")"' otel/copilot-otel.jsonl
+
+
+5. System prompt and tool definitions
+-------------------------------------
+jq -r 'select(.type=="span") | .attributes["gen_ai.system_instructions"] // empty | fromjson' otel/copilot-otel.jsonl
+jq -r 'select(.type=="span") | .attributes["gen_ai.tool.definitions"]   // empty | fromjson' otel/copilot-otel.jsonl
+
+
+6. Inventory -- what is in a file
+---------------------------------
+# record types (CLI file exporter)
+jq -r .type otel/copilot-otel.jsonl | sort | uniq -c
+
+# span names
+jq -r '.resourceSpans[]?.scopeSpans[]?.spans[]?.name' otel/live/otel-live.jsonl | sort | uniq -c
+jq -r 'select(.type=="span") | .name'                 otel/copilot-otel.jsonl  | sort | uniq -c
+
+# services
+jq -r '.resourceSpans[]?,.resourceMetrics[]?,.resourceLogs[]?
+       | .resource.attributes[]? | select(.key=="service.name") | .value.stringValue' \
+  otel/live/otel-live.jsonl | sort | uniq -c
+
+# metric names
+jq -r 'select(.type=="metric") | .name' otel/copilot-otel.jsonl | sort | uniq -c
+
+# token usage per chat span
+jq -r 'select(.type=="span" and (.name|startswith("chat")))
+       | .attributes
+       | "in=\(."gen_ai.usage.input_tokens") out=\(."gen_ai.usage.output_tokens") cache=\(."gen_ai.usage.cache_read.input_tokens")"' \
+  otel/copilot-otel.jsonl
+
+
+7. VS Code log records (logs signal -- CLI does not emit these)
+---------------------------------------------------------------
+jq -r 'select(.attributes["event.name"]) | "\(.hrTime[0])  \(._body)"' otel/live/vscode-otel.jsonl
+
+
+Note: otel/.gitignore is `*`, so this file is ignored along with the capture data.
